@@ -165,6 +165,8 @@ def find_checkerboard(
         if scale < 1.0
         else original_gray
     )
+    scale_x = region.shape[1] / detection_gray.shape[1]
+    scale_y = region.shape[0] / detection_gray.shape[0]
     enhanced_gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(detection_gray)
     for candidate_gray in (detection_gray, enhanced_gray):
         corners, method = _detect_on(candidate_gray, pattern)
@@ -172,7 +174,8 @@ def find_checkerboard(
             continue
 
         local_points = corners.reshape(-1, 2).astype(np.float64)
-        local_points /= scale
+        local_points[:, 0] *= scale_x
+        local_points[:, 1] *= scale_y
         # SB already returns subpixel corner positions. A second generic
         # refinement can pull them toward seams or uneven square edges.
         if method == "findChessboardCorners + cornerSubPix" and scale < 1.0:
@@ -198,6 +201,14 @@ def find_checkerboard(
             "method": method,
             "roi": tuple(int(value) for value in roi),
             "image_size": (int(image_rgb.shape[1]), int(image_rgb.shape[0])),
+            "coordinate_transform": {
+                "scale_x": scale_x,
+                "scale_y": scale_y,
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+                "detection_width": int(detection_gray.shape[1]),
+                "detection_height": int(detection_gray.shape[0]),
+            },
             "failure_reason": None if len(points) == expected else "Detected intersection count is incomplete.",
         }
     return {
@@ -209,6 +220,14 @@ def find_checkerboard(
         "method": None,
         "roi": tuple(int(value) for value in roi),
         "image_size": (int(image_rgb.shape[1]), int(image_rgb.shape[0])),
+        "coordinate_transform": {
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "detection_width": int(detection_gray.shape[1]),
+            "detection_height": int(detection_gray.shape[0]),
+        },
         "failure_reason": (
             "No complete checkerboard was found. Adjust the ROI and grid dimensions, "
             "or use the four-corner manual estimate."
@@ -508,6 +527,145 @@ def _summary(measurements: pd.DataFrame, include_estimates: bool) -> pd.DataFram
     )
 
 
+def _planar_overlay(
+    image_rgb: np.ndarray,
+    analysis: dict[str, Any],
+    grid: np.ndarray,
+    direct_intersections: np.ndarray,
+    arrow_scale: float,
+) -> np.ndarray:
+    """Draw detected and predicted points without hiding generated grid nodes."""
+    annotated = image_rgb.copy()
+    points = analysis["observed_points"]
+    predicted = analysis["predicted_points"]
+    hull = cv2.convexHull(np.rint(points).astype(np.int32))
+    cv2.polylines(annotated, [hull], True, (255, 255, 0), 2, cv2.LINE_AA)
+
+    for row, column in zip(*np.where(~np.asarray(direct_intersections, dtype=bool))):
+        location = tuple(np.rint(grid[row, column]).astype(int))
+        cv2.circle(annotated, location, 5, (255, 150, 20), 2, cv2.LINE_AA)
+    for observed, fitted in zip(points, predicted):
+        start = tuple(np.rint(observed).astype(int))
+        end = tuple(np.rint(fitted).astype(int))
+        cv2.circle(annotated, start, 5, (30, 220, 80), -1, cv2.LINE_AA)
+        cv2.drawMarker(annotated, end, (40, 100, 255), cv2.MARKER_CROSS, 13, 2, cv2.LINE_AA)
+        arrow_end = tuple(np.rint(observed + (fitted - observed) * arrow_scale).astype(int))
+        cv2.arrowedLine(annotated, start, arrow_end, (220, 40, 220), 2, cv2.LINE_AA, tipLength=0.25)
+    return annotated
+
+
+def _show_planar_diagnostic(
+    st: Any,
+    image: np.ndarray,
+    detection: dict[str, Any],
+    grid: np.ndarray,
+    direct: np.ndarray,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    from planar_diagnostic import analyze_planar_deviation
+
+    st.subheader("Deviation from planar homography")
+    use_ransac = st.checkbox("Add separate RANSAC comparison", value=False, key="planar_use_ransac")
+    threshold = (
+        float(st.number_input(
+            "RANSAC threshold (original-image pixels)",
+            min_value=0.1,
+            value=2.0,
+            step=0.5,
+            key="planar_ransac_threshold",
+        ))
+        if use_ransac
+        else None
+    )
+    analysis = analyze_planar_deviation(detection, ransac_threshold_px=threshold)
+    records = analysis["records"]
+    metrics = analysis["metrics"]
+    st.caption(
+        f"{metrics['corner_count']} original detected corners; convex-hull coverage "
+        f"{metrics['coverage_area_px2']:.1f} px² ({metrics['coverage_fraction']:.2%} of the frame). "
+        "Only detected corners are fitted and scored; generated boundary points remain separate."
+    )
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("RMSE", f"{metrics['rmse_px']:.3f} px")
+    metric_columns[1].metric("Median", f"{metrics['median_px']:.3f} px")
+    metric_columns[2].metric("95th percentile", f"{metrics['p95_px']:.3f} px")
+    metric_columns[3].metric("Maximum", f"{metrics['maximum_px']:.3f} px")
+
+    arrow_scale = float(st.slider(
+        "Residual arrow magnification",
+        min_value=1.0,
+        max_value=20.0,
+        value=5.0,
+        step=1.0,
+        key="planar_arrow_scale",
+    ))
+    overlay = _planar_overlay(image, analysis, grid, direct, arrow_scale)
+    preview_scale = min(1.0, 1400 / max(image.shape[:2]))
+    if preview_scale < 1:
+        overlay = cv2.resize(overlay, None, fx=preview_scale, fy=preview_scale, interpolation=cv2.INTER_AREA)
+    st.image(
+        overlay,
+        caption=(
+            "Green: observed; blue cross: predicted; magenta: residual arrow "
+            f"({arrow_scale:g}×); orange rings: generated boundary; cyan: measured-region hull."
+        ),
+    )
+
+    x = records["observed_x_px"].to_numpy()
+    y = records["observed_y_px"].to_numpy()
+    dx = records["dx_px"].to_numpy()
+    dy = records["dy_px"].to_numpy()
+    magnitude = records["error_magnitude_px"].to_numpy()
+    figure, axes = plt.subplots(2, 2, figsize=(11, 8))
+    axes[0, 0].scatter(x, dx, c=dx, cmap="coolwarm")
+    axes[0, 0].set(xlabel="Image x (px)", ylabel="dx (px)", title="dx vs image x")
+    axes[0, 1].scatter(y, dx, c=dx, cmap="coolwarm")
+    axes[0, 1].set(xlabel="Image y (px)", ylabel="dx (px)", title="dx vs image y")
+    axes[1, 0].scatter(x, dy, c=dy, cmap="coolwarm")
+    axes[1, 0].set(xlabel="Image x (px)", ylabel="dy (px)", title="dy vs image x")
+    axes[1, 1].scatter(y, dy, c=dy, cmap="coolwarm")
+    axes[1, 1].set(xlabel="Image y (px)", ylabel="dy (px)", title="dy vs image y")
+    st.pyplot(figure, clear_figure=True)
+
+    image_width, image_height = analysis["image_size"]
+    figure, axis = plt.subplots(figsize=(8, 6))
+    heatmap = axis.scatter(x, y, c=magnitude, cmap="viridis", s=55, marker="s")
+    hull_points = cv2.convexHull(np.rint(analysis["observed_points"]).astype(np.int32)).reshape(-1, 2)
+    closed_hull = np.vstack((hull_points, hull_points[:1]))
+    axis.plot(closed_hull[:, 0], closed_hull[:, 1], color="cyan")
+    axis.set(xlim=(0, image_width), ylim=(image_height, 0), xlabel="Image x (px)", ylabel="Image y (px)")
+    axis.set_aspect("equal", adjustable="box")
+    axis.set_title("Residual magnitude (unmeasured regions blank)")
+    figure.colorbar(heatmap, ax=axis, label="Residual magnitude (px)")
+    st.pyplot(figure, clear_figure=True)
+
+    row_summary = records.groupby("grid_row", as_index=False).agg(
+        corner_count=("corner_id", "count"),
+        mean_dx_px=("dx_px", "mean"),
+        mean_dy_px=("dy_px", "mean"),
+        mean_error_px=("error_magnitude_px", "mean"),
+    )
+    column_summary = records.groupby("grid_column", as_index=False).agg(
+        corner_count=("corner_id", "count"),
+        mean_dx_px=("dx_px", "mean"),
+        mean_dy_px=("dy_px", "mean"),
+        mean_error_px=("error_magnitude_px", "mean"),
+    )
+    left, right = st.columns(2)
+    left.caption("Grid-row summaries")
+    left.dataframe(row_summary.round(3), use_container_width=True)
+    right.caption("Grid-column summaries")
+    right.dataframe(column_summary.round(3), use_container_width=True)
+    st.dataframe(records.round(4), use_container_width=True, height=350)
+    st.download_button(
+        "Download planar deviation CSV",
+        records.to_csv(index=False, float_format="%.15g").encode("utf-8-sig"),
+        "planar_homography_deviation.csv",
+        "text/csv",
+    )
+
+
 def main() -> None:
     import streamlit as st
 
@@ -736,6 +894,12 @@ def main() -> None:
         overlay_preview = cv2.resize(overlay, None, fx=preview_scale, fy=preview_scale, interpolation=cv2.INTER_AREA) if preview_scale < 1 else overlay
         st.image(overlay_preview, caption="Green: detected grid; orange: extrapolated boundary; red: directly detected intersections; yellow: suspect fit.")
         st.dataframe(measurements.round(3), use_container_width=True, height=450)
+        if not is_manual and result_metadata.get("success"):
+            with st.expander("Planar-homography diagnostic", expanded=False):
+                try:
+                    _show_planar_diagnostic(st, image, result_metadata, grid, direct)
+                except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+                    st.error(f"Planar-homography diagnostic failed: {exc}")
         st.download_button("Download measurements CSV", csv_bytes(measurements), "checkerboard_measurements.csv", "text/csv")
         st.download_button("Download full-resolution annotated PNG", _png_bytes(overlay), "checkerboard_annotated.png", "image/png")
         metadata = {

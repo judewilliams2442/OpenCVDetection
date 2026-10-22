@@ -53,6 +53,11 @@ python -m pytest
 6. Inspect the per-square table and summary, optionally exclude estimates from
    summary statistics, and download CSV, full-resolution PNG, and JSON exports.
    The label toggle controls whether square IDs appear on the overlay.
+7. Expand **Planar-homography diagnostic** after accepting an automatic
+   detection to compare original detected intersections with a best-fit ideal
+   unit grid under perspective. This reports **deviation from planar
+   homography**, not lens distortion; generated boundary points remain visible
+   separately and are not included in the fit or residual statistics.
 
 Each measured square reports its four corners, individual edge lengths, mean
 horizontal and vertical dimensions, diagonals, area, and measurement source.
@@ -73,6 +78,11 @@ rounded for readability.
   shapes. Perspective and a non-flat board can make projected cells skew or
   vary across the image. Review individual corner markers against the visible
   black/white junctions, particularly where wrinkles or seams cross the board.
+- The planar-homography diagnostic fits only unique, genuinely detected
+  internal corners in original-frame pixels. Its sparse residual heatmap,
+  corner table, row/column summaries, and CSV describe departures from a
+  planar perspective grid; optional RANSAC classification is an additional
+  comparison and does not remove points from baseline metrics.
 - The manual fallback uses bilinear interpolation from only the four supplied
   outer corners. It estimates, rather than detects, intermediate intersections
   and is less geometrically constrained than the automatic homography fit.
