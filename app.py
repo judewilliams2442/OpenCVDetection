@@ -563,6 +563,7 @@ def _show_planar_diagnostic(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    from ollama_summary import build_summary_context, summarize_with_ollama
     from planar_diagnostic import analyze_planar_deviation
 
     st.subheader("Deviation from planar homography")
@@ -657,6 +658,35 @@ def _show_planar_diagnostic(
     left.dataframe(row_summary.round(3), use_container_width=True)
     right.caption("Grid-column summaries")
     right.dataframe(column_summary.round(3), use_container_width=True)
+
+    st.markdown("#### Optional local AI summary")
+    st.caption(
+        "Only computed metrics and corner summaries are sent to Ollama at localhost:11434; "
+        "the image itself is not sent. AI text can be mistaken, so compare its statements with "
+        "the measurements; it does not replace them."
+    )
+    model = st.text_input(
+        "Ollama model",
+        value="qwen3.5:4b",
+        key="planar_ollama_model",
+        help="Enter a model name installed in Ollama, such as qwen3.5:4b.",
+    )
+    summary_context = build_summary_context(analysis)
+    summary_fingerprint = hashlib.sha256(
+        json.dumps(summary_context, sort_keys=True, allow_nan=False).encode("utf-8")
+    ).hexdigest()
+    summary_key = f"planar_ollama_summary_{summary_fingerprint}_{model.strip()}"
+    if st.button("Summarize locally with Ollama", key="planar_ollama_summarize"):
+        st.session_state.pop(summary_key, None)
+        try:
+            with st.spinner(f"Waiting for local model {model.strip() or '(no model selected)'}..."):
+                st.session_state[summary_key] = summarize_with_ollama(analysis, model)
+        except (ValueError, RuntimeError) as exc:
+            st.error(f"Local AI summary failed: {exc}")
+    if summary_key in st.session_state:
+        st.markdown(f"**Summary from `{model.strip()}`**")
+        st.write(st.session_state[summary_key])
+
     st.dataframe(records.round(4), use_container_width=True, height=350)
     st.download_button(
         "Download planar deviation CSV",

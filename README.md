@@ -58,6 +58,11 @@ python -m pytest
    unit grid under perspective. This reports **deviation from planar
    homography**, not lens distortion; generated boundary points remain visible
    separately and are not included in the fit or residual statistics.
+8. Optionally enter an installed Ollama model name (the default is
+   `qwen3.5:4b`) and choose **Summarize locally with Ollama**. Ollama must be
+   running at `localhost:11434`. Only computed diagnostic summaries are sent;
+   the image is not. The model provides an interpretation, not a new
+   measurement or diagnosis.
 
 Each measured square reports its four corners, individual edge lengths, mean
 horizontal and vertical dimensions, diagonals, area, and measurement source.
