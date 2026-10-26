@@ -46,6 +46,11 @@ python -m pytest
    only after inspecting the overlay. Green indicates grid segments supported
    by direct detections; orange indicates extrapolated boundary segments; red
    markers show directly detected intersections; yellow marks a suspect fit.
+   If the board is clipped at the image edge, the detector can use OpenCV's
+   larger-pattern metadata; only squares enclosed by detected intersections are
+   measured, and incomplete outer-edge squares are excluded rather than extrapolated.
+   If the entered size is not found, the detector also tries patterns one row or
+   column smaller and reports the detected dimensions for review.
 5. If detection does not work, expand the manual fallback and enter the outer
    board corners in top-left, top-right, bottom-right, bottom-left order. This
    bilinearly interpolated quadrilateral grid is labeled an estimate, not a
@@ -53,6 +58,10 @@ python -m pytest
 6. Inspect the per-square table and summary, optionally exclude estimates from
    summary statistics, and download CSV, full-resolution PNG, and JSON exports.
    The label toggle controls whether square IDs appear on the overlay.
+    Choose **Generate comprehensive PDF report** to create a shareable report
+    with the image and overlay, measurement summaries, spatial dimension maps,
+    X/Y residual-trend analysis when direct detections are available, and a
+    per-square appendix.
 7. Expand **Planar-homography diagnostic** after accepting an automatic
    detection to compare original detected intersections with a best-fit ideal
    unit grid under perspective. This reports **deviation from planar
@@ -77,7 +86,9 @@ rounded for readability.
 - Internal chessboard intersections are directly detected; the outer board
   boundary is extrapolated. Consequently, outermost squares are estimates and
   are explicitly identified as such. Cropped, occluded, irregular, or strongly
-  distorted boards may not support reliable extrapolation.
+  distorted boards may not support reliable extrapolation. For a board clipped
+  by the image frame, automatic measurements include only cells bounded by
+  detected internal intersections; partial edge cells are omitted.
 - Automatically detected internal intersections are measured at their
   subpixel image locations; they are not forced into ideal square or parallel
   shapes. Perspective and a non-flat board can make projected cells skew or
@@ -88,6 +99,12 @@ rounded for readability.
   corner table, row/column summaries, and CSV describe departures from a
   planar perspective grid; optional RANSAC classification is an additional
   comparison and does not remove points from baseline metrics.
+- PDF X/Y trend analysis compares constant, linear, quadratic, and cubic
+  polynomials using spatially held-out checkerboard bands. A predictive
+  low-order trend is evidence of structured residuals, not proof of lens
+  distortion. One image cannot establish that residuals are random or
+  distinguish lens effects from board curvature, perspective-model mismatch,
+  lighting, and corner-localization error.
 - The manual fallback uses bilinear interpolation from only the four supplied
   outer corners. It estimates, rather than detects, intermediate intersections
   and is less geometrically constrained than the automatic homography fit.

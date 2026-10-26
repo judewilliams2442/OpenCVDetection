@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
+import pandas as pd
 import pytest
 
 import app
-from planar_diagnostic import analyze_planar_deviation
+from planar_diagnostic import analyze_axis_nonlinearity, analyze_planar_deviation
 
 
 def _detection(points, rows=5, columns=6):
@@ -141,3 +142,34 @@ def test_ransac_is_additional_and_does_not_change_baseline_metrics():
     assert compared["metrics"] == baseline["metrics"]
     assert "ransac_classification" in compared["records"]
     assert len(compared["records"]) == len(points)
+
+
+def test_axis_nonlinearity_finds_predictive_polynomial_trends():
+    rows, columns = 8, 12
+    indices = np.array(
+        [(row, column) for row in range(rows) for column in range(columns)]
+    )
+    x = np.tile(np.linspace(-1, 1, columns), rows)
+    y = np.repeat(np.linspace(-1, 1, rows), columns)
+    records = pd.DataFrame(
+        {
+            "observed_x_px": (x + 1) * 400,
+            "observed_y_px": (y + 1) * 300,
+            "dx_px": 2 + 5 * x**2,
+            "dy_px": -1 + 4 * y**3,
+        }
+    )
+    analysis = {
+        "records": records,
+        "grid_indices": indices,
+        "image_size": (800, 600),
+    }
+
+    result = analyze_axis_nonlinearity(analysis)
+
+    assert result["x"]["available"]
+    assert result["x"]["best_degree"] >= 2
+    assert result["x"]["improvement_over_linear"] > 0.1
+    assert result["y"]["available"]
+    assert result["y"]["best_degree"] >= 2
+    assert result["y"]["improvement_over_linear"] > 0.1

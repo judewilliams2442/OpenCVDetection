@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from analysis_report import build_analysis_report_pdf
+
 MAX_IMAGE_PIXELS = 100_000_000
 MAX_DETECTION_SIDE = 2400
 
@@ -146,6 +148,38 @@ def _detect_on(gray: np.ndarray, pattern: tuple[int, int]) -> tuple[np.ndarray |
     return None, None
 
 
+def _detect_larger_on(gray: np.ndarray, pattern: tuple[int, int]) -> np.ndarray | None:
+    """Read a fully detected inner grid from SB metadata when board edges are clipped."""
+    try:
+        flags = (
+            cv2.CALIB_CB_NORMALIZE_IMAGE
+            | cv2.CALIB_CB_EXHAUSTIVE
+            | cv2.CALIB_CB_ACCURACY
+            | cv2.CALIB_CB_LARGER
+        )
+        found, corners, metadata = cv2.findChessboardCornersSBWithMeta(
+            gray, pattern, flags=flags
+        )
+    except (cv2.error, AttributeError):
+        return None
+    if not found or corners is None or metadata is None:
+        return None
+
+    rows, columns = pattern[1], pattern[0]
+    try:
+        corner_grid = corners.reshape(metadata.shape + (2,)).transpose(1, 0, 2)
+        metadata_grid = metadata.T
+    except ValueError:
+        return None
+    if corner_grid.shape[0] < rows or corner_grid.shape[1] < columns:
+        return None
+    if np.any(metadata_grid[:rows, :columns] == 0):
+        return None
+    if np.any(metadata_grid[rows:, :]) or np.any(metadata_grid[:rows, columns:]):
+        return None
+    return corner_grid[:rows, :columns].reshape(-1, 2)
+
+
 def find_checkerboard(
     image_rgb: np.ndarray,
     square_columns: int,
@@ -170,6 +204,12 @@ def find_checkerboard(
     enhanced_gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(detection_gray)
     for candidate_gray in (detection_gray, enhanced_gray):
         corners, method = _detect_on(candidate_gray, pattern)
+        visible_only = False
+        if corners is None:
+            corners = _detect_larger_on(candidate_gray, pattern)
+            if corners is not None:
+                method = "findChessboardCornersSBWithMeta + CALIB_CB_LARGER"
+                visible_only = True
         if corners is None:
             continue
 
@@ -199,6 +239,7 @@ def find_checkerboard(
             "expected_count": expected,
             "detected_count": len(points),
             "method": method,
+            "visible_only": visible_only,
             "roi": tuple(int(value) for value in roi),
             "image_size": (int(image_rgb.shape[1]), int(image_rgb.shape[0])),
             "coordinate_transform": {
@@ -218,6 +259,7 @@ def find_checkerboard(
         "expected_count": pattern[0] * pattern[1],
         "detected_count": 0,
         "method": None,
+        "visible_only": False,
         "roi": tuple(int(value) for value in roi),
         "image_size": (int(image_rgb.shape[1]), int(image_rgb.shape[0])),
         "coordinate_transform": {
@@ -233,6 +275,44 @@ def find_checkerboard(
             "or use the four-corner manual estimate."
         ),
     }
+
+
+def find_checkerboard_nearby_dimensions(
+    image_rgb: np.ndarray,
+    square_columns: int,
+    square_rows: int,
+    roi: tuple[int, int, int, int],
+) -> dict[str, Any]:
+    """Try slightly smaller board sizes when clipped edges hide requested corners."""
+    detection = find_checkerboard(image_rgb, square_columns, square_rows, roi)
+    if detection["success"]:
+        detection["detected_square_dimensions"] = (square_columns, square_rows)
+        return detection
+
+    candidates = []
+    nearby_dimensions = (
+        (square_columns - 1, square_rows),
+        (square_columns, square_rows - 1),
+        (square_columns - 1, square_rows - 1),
+    )
+    for columns, rows in nearby_dimensions:
+        if columns < 3 or rows < 3:
+            continue
+        candidate = find_checkerboard(image_rgb, columns, rows, roi)
+        if candidate["success"]:
+            points = np.asarray(candidate["points"], dtype=np.float32)
+            coverage = float(cv2.contourArea(cv2.convexHull(points)))
+            candidates.append((candidate["detected_count"], coverage, columns, rows, candidate))
+
+    if not candidates:
+        return detection
+
+    _, _, columns, rows, detection = max(candidates, key=lambda item: (item[0], item[1]))
+    detection["detected_square_dimensions"] = (columns, rows)
+    detection["requested_square_dimensions"] = (square_columns, square_rows)
+    detection["dimension_adjustment"] = True
+    detection["visible_only"] = True
+    return detection
 
 
 def estimate_grid_dimensions(
@@ -264,7 +344,7 @@ def estimate_grid_dimensions(
 
 
 def fit_board_grid(detection: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    """Fit a planar grid, preserving detected intersections and extrapolating borders."""
+    """Fit a planar grid, extrapolating borders only for fully visible boards."""
     if not detection.get("success"):
         raise ValueError("Cannot fit a grid to a failed detection.")
     points = np.asarray(detection.get("points"), dtype=np.float64)
@@ -280,6 +360,17 @@ def fit_board_grid(detection: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError("The detected points do not produce a stable homography.")
     if abs(np.linalg.det(matrix)) < 1e-12 or np.linalg.cond(matrix) > 1e12:
         raise ValueError("The homography is singular or unstable; inspect the ROI and detection.")
+    projected = cv2.perspectiveTransform(
+        canonical.reshape(-1, 1, 2), matrix
+    ).reshape(-1, 2)
+    residuals = np.linalg.norm(projected - points, axis=1)
+    detection["reprojection_rms_px"] = float(np.sqrt(np.mean(residuals**2)))
+    detection["reprojection_max_px"] = float(np.max(residuals))
+    detection["homography"] = matrix.tolist()
+    if detection.get("visible_only"):
+        grid = points.reshape(rows, columns, 2).copy()
+        return grid, np.ones((rows, columns), dtype=bool)
+
     square_columns, square_rows = columns + 1, rows + 1
     full_coordinates = np.array(
         [
@@ -309,14 +400,9 @@ def fit_board_grid(detection: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
                 if outside[row : row + 2, column : column + 2].any():
                     invalid_cells.append(square_index(row, column))
         if invalid_cells:
-            raise ValueError(
-                "Extrapolated board boundaries place these squares outside the original frame "
-                f"({', '.join(invalid_cells)}); the board may be cropped, so automatic measurements were withheld."
-            )
-    projected = cv2.perspectiveTransform(canonical.reshape(-1, 1, 2), matrix).reshape(-1, 2)
-    residuals = np.linalg.norm(projected - points, axis=1)
-    detection["reprojection_rms_px"] = float(np.sqrt(np.mean(residuals**2)))
-    detection["reprojection_max_px"] = float(np.max(residuals))
+            detection["visible_only"] = True
+            grid = points.reshape(rows, columns, 2).copy()
+            return grid, np.ones((rows, columns), dtype=bool)
     grid[1:-1, 1:-1] = points.reshape(rows, columns, 2)
     direct = np.zeros((square_rows + 1, square_columns + 1), dtype=bool)
     direct[1:-1, 1:-1] = True
@@ -582,10 +668,15 @@ def _show_planar_diagnostic(
     analysis = analyze_planar_deviation(detection, ransac_threshold_px=threshold)
     records = analysis["records"]
     metrics = analysis["metrics"]
+    boundary_note = (
+        "No board-boundary points were extrapolated."
+        if detection.get("visible_only")
+        else "Generated boundary points remain separate."
+    )
     st.caption(
         f"{metrics['corner_count']} original detected corners; convex-hull coverage "
         f"{metrics['coverage_area_px2']:.1f} px² ({metrics['coverage_fraction']:.2%} of the frame). "
-        "Only detected corners are fitted and scored; generated boundary points remain separate."
+        f"Only detected corners are fitted and scored; {boundary_note}"
     )
     metric_columns = st.columns(4)
     metric_columns[0].metric("RMSE", f"{metrics['rmse_px']:.3f} px")
@@ -791,16 +882,25 @@ def main() -> None:
         st.session_state.pop("accept_detection", None)
         st.session_state.pop("checkerboard_result", None)
         try:
-            detection = find_checkerboard(image, square_columns, square_rows, roi)
+            detection = find_checkerboard_nearby_dimensions(
+                image, square_columns, square_rows, roi
+            )
+            detected_columns, detected_rows = detection.get(
+                "detected_square_dimensions", (square_columns, square_rows)
+            )
             if detection["success"]:
                 grid, direct = fit_board_grid(detection)
-                detection["square_columns"] = square_columns
-                detection["square_rows"] = square_rows
+                detection["square_columns"] = detected_columns
+                detection["square_rows"] = detected_rows
+                detection["requested_square_columns"] = square_columns
+                detection["requested_square_rows"] = square_rows
                 detection["image_signature"] = image_signature
                 st.session_state["checkerboard_result"] = (detection, grid, direct)
             else:
                 detection["square_columns"] = square_columns
                 detection["square_rows"] = square_rows
+                detection["requested_square_columns"] = square_columns
+                detection["requested_square_rows"] = square_rows
                 detection["image_signature"] = image_signature
                 detection["roi"] = roi
                 st.session_state["checkerboard_result"] = (detection, None, None)
@@ -811,8 +911,10 @@ def main() -> None:
         stored_settings = stored[0]
         if (
             stored_settings.get("image_signature") != image_signature
-            or stored_settings.get("square_columns") != square_columns
-            or stored_settings.get("square_rows") != square_rows
+            or stored_settings.get("requested_square_columns", stored_settings.get("square_columns"))
+            != square_columns
+            or stored_settings.get("requested_square_rows", stored_settings.get("square_rows"))
+            != square_rows
             or tuple(stored_settings.get("roi", ())) != roi
         ):
             stored = None
@@ -828,6 +930,20 @@ def main() -> None:
         if not detection["success"]:
             st.warning(detection["failure_reason"])
         else:
+            if detection.get("dimension_adjustment"):
+                requested = detection["requested_square_dimensions"]
+                detected = detection["detected_square_dimensions"]
+                st.warning(
+                    f"No complete {requested[0]} × {requested[1]} grid matched. "
+                    f"A {detected[0]} × {detected[1]} subgrid was detected instead. "
+                    "Review the overlay; measurements and square labels use this detected region."
+                )
+            if detection.get("visible_only"):
+                st.info(
+                    "The board is clipped at the image edge. Only squares bounded by "
+                    "detected intersections are measured; partial outer-edge squares are excluded. "
+                    "Square labels are local to the measured region."
+                )
             rms = detection["reprojection_rms_px"]
             cell_scale = float(np.median(np.linalg.norm(np.diff(grid, axis=1), axis=2)))
             suspect = rms > max(2.0, cell_scale * 0.02)
@@ -932,10 +1048,57 @@ def main() -> None:
                     st.error(f"Planar-homography diagnostic failed: {exc}")
         st.download_button("Download measurements CSV", csv_bytes(measurements), "checkerboard_measurements.csv", "text/csv")
         st.download_button("Download full-resolution annotated PNG", _png_bytes(overlay), "checkerboard_annotated.png", "image/png")
+        report_key = hashlib.sha256(
+            image_signature.encode("ascii")
+            + repr(roi).encode("ascii")
+            + uploaded.name.encode("utf-8")
+            + csv_bytes(measurements)
+            + str(include_estimates).encode("ascii")
+        ).hexdigest()
+        st.markdown("#### Comprehensive analysis report")
+        st.caption(
+            "Generate a shareable PDF with image and overlay, measurement summaries, "
+            "spatial dimension maps, per-square results, and cross-validated X/Y residual-trend analysis "
+            "when directly detected corners are available."
+        )
+        if st.button("Generate comprehensive PDF report"):
+            try:
+                with st.spinner("Building the report and spatial trend analysis..."):
+                    report_overlay = annotate_image(
+                        image,
+                        grid,
+                        direct,
+                        measurements,
+                        show_labels=False,
+                        suspect=suspect and not is_manual,
+                    )
+                    report_pdf = build_analysis_report_pdf(
+                        image,
+                        report_overlay,
+                        measurements,
+                        result_metadata,
+                        roi,
+                        uploaded.name,
+                        include_estimates,
+                    )
+                st.session_state["analysis_report"] = (report_key, report_pdf)
+            except (ValueError, np.linalg.LinAlgError, KeyError) as exc:
+                st.error(f"Report generation failed: {exc}")
+        saved_report = st.session_state.get("analysis_report")
+        if saved_report and saved_report[0] == report_key:
+            st.download_button(
+                "Download comprehensive analysis report (PDF)",
+                saved_report[1],
+                "checkerboard_analysis_report.pdf",
+                "application/pdf",
+            )
         metadata = {
             "detection_method": result_metadata.get("method"),
             "square_columns": result_metadata.get("square_columns"),
             "square_rows": result_metadata.get("square_rows"),
+            "requested_square_columns": result_metadata.get("requested_square_columns"),
+            "requested_square_rows": result_metadata.get("requested_square_rows"),
+            "visible_intersections_only": bool(result_metadata.get("visible_only", False)),
             "expected_intersections": result_metadata.get(
                 "expected_count",
                 (result_metadata.get("square_columns", 0) - 1)
@@ -955,7 +1118,10 @@ def main() -> None:
             "checkerboard_measurements.json",
             "application/json",
         )
-        st.caption("Legend: red dots are directly detected intersections; green grid segments are supported by detected points; orange segments/cells use extrapolated boundaries; yellow indicates a suspect fit.")
+        legend = "red dots are directly detected intersections; green grid segments are supported by detected points; orange segments/cells use extrapolated boundaries; yellow indicates a suspect fit."
+        if result_metadata.get("visible_only"):
+            legend += " Partial outer-edge cells are excluded; square labels are local to the measured region."
+        st.caption(f"Legend: {legend}")
 
 
 if __name__ == "__main__":

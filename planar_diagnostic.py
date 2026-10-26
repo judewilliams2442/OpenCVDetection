@@ -138,3 +138,98 @@ def analyze_planar_deviation(
             "maximum_px": float(np.max(magnitudes)),
         },
     }
+
+
+def analyze_axis_nonlinearity(analysis: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Evaluate smooth X/Y residual trends with spatially blocked cross-validation."""
+    records = analysis["records"]
+    indices = np.asarray(analysis["grid_indices"], dtype=np.int64)
+    image_width, image_height = analysis["image_size"]
+    specifications = (
+        ("x", 1, "observed_x_px", "dx_px", image_width),
+        ("y", 0, "observed_y_px", "dy_px", image_height),
+    )
+    results: dict[str, dict[str, Any]] = {}
+
+    for name, index_axis, coordinate_column, residual_column, image_extent in specifications:
+        coordinate = (
+            records[coordinate_column].to_numpy(dtype=np.float64) - image_extent / 2
+        ) / (image_extent / 2)
+        residual = records[residual_column].to_numpy(dtype=np.float64)
+        axis_groups = indices[:, index_axis]
+        unique_groups = np.unique(axis_groups)
+        if len(unique_groups) < 5 or len(residual) < 12:
+            results[name] = {
+                "available": False,
+                "interpretation": "Insufficient spatial coverage for blocked cross-validation.",
+            }
+            continue
+
+        folds = np.array_split(unique_groups, min(5, len(unique_groups)))
+        cv_errors: dict[int, float] = {}
+        for degree in range(min(3, len(unique_groups) - 2) + 1):
+            squared_errors = []
+            for held_out_groups in folds:
+                test = np.isin(axis_groups, held_out_groups)
+                train = ~test
+                if train.sum() <= degree:
+                    continue
+                design = np.vander(coordinate, N=degree + 1, increasing=True)
+                coefficients, *_ = np.linalg.lstsq(design[train], residual[train], rcond=None)
+                squared_errors.extend((design[test] @ coefficients - residual[test]) ** 2)
+            if squared_errors:
+                cv_errors[degree] = float(np.sqrt(np.mean(squared_errors)))
+
+        if 0 not in cv_errors or 1 not in cv_errors:
+            results[name] = {
+                "available": False,
+                "interpretation": "Insufficient independent spatial folds to compare trend models.",
+            }
+            continue
+
+        best_degree = min(cv_errors, key=lambda degree: (cv_errors[degree], degree))
+        best_rmse = cv_errors[best_degree]
+        baseline_rmse = cv_errors[0]
+        linear_rmse = cv_errors[1]
+        improvement_over_constant = (
+            0.0 if baseline_rmse == 0 else 1 - best_rmse / baseline_rmse
+        )
+        improvement_over_linear = (
+            0.0 if linear_rmse == 0 else 1 - best_rmse / linear_rmse
+        )
+        if best_degree >= 2 and improvement_over_constant >= 0.1 and improvement_over_linear >= 0.1:
+            interpretation = (
+                f"A degree-{best_degree} nonlinear trend predicts held-out spatial bands "
+                "better than both a constant and a linear model."
+            )
+        elif improvement_over_constant >= 0.1:
+            interpretation = (
+                "A smooth trend is present, but the data do not show a substantial "
+                "cross-validated gain from nonlinear terms over a simpler model."
+            )
+        else:
+            interpretation = (
+                "No stable low-order spatial trend was detected; remaining variation may "
+                "reflect local board shape, corner noise, lighting, or other effects."
+            )
+
+        design = np.vander(coordinate, N=best_degree + 1, increasing=True)
+        coefficients, *_ = np.linalg.lstsq(design, residual, rcond=None)
+        results[name] = {
+            "available": True,
+            "axis": name.upper(),
+            "coordinate_column": coordinate_column,
+            "residual_column": residual_column,
+            "normalized_coordinates": coordinate,
+            "residuals_px": residual,
+            "best_degree": best_degree,
+            "coefficients_px": coefficients,
+            "cross_validated_rmse_px": cv_errors,
+            "improvement_over_constant": improvement_over_constant,
+            "improvement_over_linear": improvement_over_linear,
+            "interpretation": interpretation,
+            "fold_count": len(folds),
+            "sample_count": len(residual),
+        }
+
+    return results
